@@ -239,20 +239,78 @@ function parseShareUrl(rawUrl) {
 // ====== HTTP 客户端封装 ======
 function httpJson(opts) {
   // opts: { url, method, headers, body }
-  return fetch(opts.url, {
-    method: opts.method || "GET",
-    headers: opts.headers || {},
-    body: opts.body || undefined,
-  }).then(function (resp) {
-    return resp.text().then(function (text) {
-      var data = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch (e) {
-        // 非 JSON
-      }
-      return { status: resp.status, ok: resp.ok, text: text, data: data };
+  var attempt = 0;
+  function once() {
+    attempt++;
+    var request = fetch(opts.url, {
+      method: opts.method || "GET",
+      headers: opts.headers || {},
+      body: opts.body || undefined,
     });
+    var timeout = new Promise(function (_, reject) {
+      setTimeout(function () {
+        reject(new Error("PikPak 单次接口请求超过 15 秒"));
+      }, 15000);
+    });
+    return Promise.race([request, timeout])
+      .then(function (resp) {
+        return resp.text().then(function (text) {
+          var data = null;
+          try {
+            data = text ? JSON.parse(text) : null;
+          } catch (e) {
+            // 非 JSON
+          }
+          return { status: resp.status, ok: resp.ok, text: text, data: data };
+        });
+      })
+      .catch(function (e) {
+        var msg = (e && e.message) || String(e);
+        if (
+          attempt < 3 &&
+          (/Network request failed/i.test(msg) ||
+            /超过 15 秒/.test(msg) ||
+            /Failed to fetch/i.test(msg))
+        ) {
+          gopeed.logger.warn(
+            "[pikpak] http retry",
+            attempt,
+            opts.method || "GET",
+            opts.url,
+            msg
+          );
+          return sleep(400 * attempt).then(once);
+        }
+        throw e;
+      });
+  }
+  return once();
+}
+
+// 有限并发映射，用于并行拉取子目录列表。
+function mapPool(items, concurrency, fn) {
+  var cursor = 0;
+  var results = new Array(items.length);
+  function worker() {
+    function next() {
+      if (cursor >= items.length) return Promise.resolve();
+      var idx = cursor++;
+      return Promise.resolve()
+        .then(function () {
+          return fn(items[idx], idx);
+        })
+        .then(function (value) {
+          results[idx] = value;
+        })
+        .then(next);
+    }
+    return next();
+  }
+  var workers = [];
+  var n = Math.min(concurrency, items.length);
+  for (var i = 0; i < n; i++) workers.push(worker());
+  return Promise.all(workers).then(function () {
+    return results;
   });
 }
 
@@ -741,13 +799,20 @@ function resolveByRestore(client, shareId, items) {
 }
 
 // ====== 业务逻辑 ======
-function listAllFiles(client, shareId, parentId, pathPrefix, ancestors) {
+function listAllFiles(client, shareId, parentId, pathPrefix, ancestors, deadlineAt) {
   // 递归列出所有文件，返回 [{name, path, size, id, ancestors}]
   ancestors = ancestors || [];
   var out = [];
   var pageToken = "";
   var page = 0;
   function loop() {
+    if (deadlineAt && Date.now() >= deadlineAt) {
+      gopeed.logger.warn(
+        "[pikpak] list stopped by deadline at",
+        pathPrefix || "(root)"
+      );
+      return Promise.resolve();
+    }
     page++;
     return client
       .getShareDetail(shareId, parentId, pageToken)
@@ -781,29 +846,37 @@ function listAllFiles(client, shareId, parentId, pathPrefix, ancestors) {
               path: pathPrefix,
               size: parseInt(f.size, 10) || 0,
               ancestors: ancestors,
+              // 某些 share/detail 响应已经包含下载地址，直接复用以减少请求。
+              url: pickDownloadUrl(f, client.useTrans),
             });
           }
         }
         pageToken = resp.next_page_token || "";
         var next = pageToken ? loop() : Promise.resolve();
         return next.then(function () {
-          // 串行处理子文件夹（避免并发触发风控）
-          return subTasks.reduce(function (p, t) {
-            return p.then(function () {
-              var sub = pathPrefix
-                ? pathPrefix + "/" + t.folder.name
-                : t.folder.name;
-              return listAllFiles(
-                client,
-                shareId,
-                t.folder.id,
-                sub,
-                ancestors.concat([t.folder.id])
-              ).then(function (childFiles) {
-                out = out.concat(childFiles);
-              });
-            });
-          }, Promise.resolve());
+          // 并行拉取子目录，显著缩短大分享的列目录时间。
+          return mapPool(subTasks, 8, function (t) {
+            if (deadlineAt && Date.now() >= deadlineAt) {
+              return [];
+            }
+            var sub = pathPrefix
+              ? pathPrefix + "/" + t.folder.name
+              : t.folder.name;
+            return listAllFiles(
+              client,
+              shareId,
+              t.folder.id,
+              sub,
+              ancestors.concat([t.folder.id]),
+              deadlineAt
+            );
+          }).then(function (nested) {
+            for (var j = 0; j < nested.length; j++) {
+              if (nested[j] && nested[j].length) {
+                out = out.concat(nested[j]);
+              }
+            }
+          });
         });
       });
   }
@@ -824,6 +897,52 @@ function pickDownloadUrl(fileInfo, useTrans) {
     return medias[0].link.url;
   }
   return "";
+}
+
+// 用有限并发补全下载地址，避免大目录逐个串行请求超过 Gopeed 解析超时。
+// deadlineAt：到达后不再领取新任务，尽量在 Gopeed 事件超时前返回已拿到的结果。
+function resolveFileInfoPool(client, shareId, files, concurrency, deadlineAt) {
+  var cursor = 0;
+  var stoppedEarly = false;
+
+  function worker() {
+    function next() {
+      if (cursor >= files.length) return Promise.resolve();
+      if (deadlineAt && Date.now() >= deadlineAt) {
+        stoppedEarly = true;
+        return Promise.resolve();
+      }
+      var item = files[cursor++];
+      return client
+        .getFileInfo(shareId, item.id)
+        .then(function (info) {
+          item.url = pickDownloadUrl(info.file_info || info, client.useTrans);
+        })
+        .catch(function (e) {
+          gopeed.logger.warn(
+            "[pikpak] file_info failed:",
+            item.name,
+            (e && e.message) || String(e)
+          );
+        })
+        .then(next);
+    }
+    return next();
+  }
+
+  var workers = [];
+  var count = Math.min(concurrency, files.length);
+  for (var i = 0; i < count; i++) {
+    workers.push(worker());
+  }
+  return Promise.all(workers).then(function () {
+    if (stoppedEarly) {
+      gopeed.logger.warn(
+        "[pikpak] file_info stopped early to avoid resolve timeout; remaining=",
+        files.length - cursor
+      );
+    }
+  });
 }
 
 function describeNames(names) {
@@ -865,92 +984,147 @@ gopeed.events.onResolve(function (ctx) {
     })
     .then(function (token) {
       client.passCodeToken = token;
-      // 从根目录开始递归列；URL 里的 initialParentId 仅是 UI 跳转参数，不影响列全部文件
-      return listAllFiles(client, parsed.shareId, "", "");
+      // 链接带 parent_id 时从该目录起步；否则从分享根递归列出全部文件。
+      var startParentId = parsed.initialParentId || "";
+      // Gopeed onResolve 约 60s；预留收尾，避免整次超时。
+      var deadlineAt = Date.now() + 50000;
+      gopeed.logger.info(
+        "[pikpak] list from parentId=" + (startParentId || "(root)")
+      );
+      return listAllFiles(
+        client,
+        parsed.shareId,
+        startParentId,
+        "",
+        startParentId ? [startParentId] : [],
+        deadlineAt
+      );
     })
     .then(function (files) {
       if (!files.length) {
         throw new Error("分享内未找到任何可下载的文件");
       }
       gopeed.logger.info("[pikpak] flat files:", files.length);
-      // 2) 逐个取分享内的下载链（匿名时只有视频有）
-      return files
-        .reduce(function (p, item) {
-          return p.then(function () {
-            return client.getFileInfo(parsed.shareId, item.id).then(function (info) {
-              var fi = info.file_info || info;
-              item.url = pickDownloadUrl(fi, client.useTrans);
-            });
+      // 大目录下逐个 file_info 会超过 Gopeed ~60s 解析超时。
+      // 解析阶段只列文件；缺下载地址的文件用占位 URL + labels，真正取链放到 onStart。
+      var resolved = [];
+      var deferred = 0;
+      for (var i = 0; i < files.length; i++) {
+        var item = files[i];
+        var headers = {
+          "User-Agent": DEFAULT_UA,
+          Referer: "https://mypikpak.com/",
+        };
+        if (item.url) {
+          resolved.push({
+            name: item.name,
+            path: item.path || "",
+            size: item.size,
+            req: {
+              url: item.url,
+              extra: { header: headers },
+            },
           });
-        }, Promise.resolve())
-        .then(function () {
-          // 3) 剩下的（zip 等）登录后转存到自己网盘再取下载链
-          var noUrl = files.filter(function (it) {
-            return !it.url;
-          });
-          if (!noUrl.length || !loggedIn) return;
-          return resolveByRestore(client, parsed.shareId, noUrl);
-        })
-        .then(function () {
-          var resolved = [];
-          var missing = [];
-          for (var i = 0; i < files.length; i++) {
-            var item = files[i];
-            if (!item.url) {
-              gopeed.logger.warn("[pikpak] no download url for", item.name);
-              missing.push(item.name);
-              continue;
-            }
-            resolved.push({
-              name: item.name,
-              path: item.path || "",
-              size: item.size,
-              req: {
-                url: item.url,
-                extra: {
-                  header: {
-                    "User-Agent": DEFAULT_UA,
-                    Referer: "https://mypikpak.com/",
-                  },
-                },
-              },
-            });
-          }
-          if (!resolved.length) {
-            throw new Error(
-              loggedIn
-                ? "已登录，但未能拿到下载地址：" +
-                    describeNames(missing) +
-                    (client.restoreError ? "（" + client.restoreError + "）" : "")
-                : "匿名访问只提供视频的播放地址，" +
-                    describeNames(missing) +
-                    " 需要登录后才能下载。请在扩展设置中填写 PikPak 账号密码或 refresh_token"
-            );
-          }
-          if (missing.length) {
-            gopeed.logger.warn(
-              "[pikpak] skipped",
-              missing.length,
-              "files without download url" +
-                (loggedIn ? "" : " (configure login to download them)")
-            );
-          }
-          // Gopeed v1.9.x 要求 name 非空（否则报 invalid resource name 并退回 HTTP 解析）；
-          // 单文件时 name 不参与保存路径，用文件名即可
-          ctx.res = {
-            name: resolved[0].name,
-            files: resolved,
-          };
-          if (resolved.length > 1) {
-            // 多文件时给出一个目录名（取分享 ID 末尾若干）
-            ctx.res.name = "PikPak-" + parsed.shareId.slice(-10);
-          }
-          gopeed.logger.info(
-            "[pikpak] resolved",
-            resolved.length,
-            "files"
-          );
+          continue;
+        }
+        deferred++;
+        resolved.push({
+          name: item.name,
+          path: item.path || "",
+          size: item.size,
+          req: {
+            // 不匹配 /s/*，避免再次触发 onResolve
+            url: "https://mypikpak.com/",
+            labels: {
+              pikpak_file: "1",
+              pikpak_share_id: parsed.shareId,
+              pikpak_file_id: item.id,
+              pikpak_pass: client.passCodeToken || "",
+              pikpak_use_trans: client.useTrans ? "1" : "0",
+              pikpak_ancestors: (item.ancestors || []).join(","),
+              pikpak_name: item.name,
+            },
+            extra: { header: headers },
+          },
         });
+      }
+      ctx.res = {
+        name:
+          resolved.length > 1
+            ? "PikPak-" + parsed.shareId.slice(-10)
+            : resolved[0].name,
+        files: resolved,
+      };
+      gopeed.logger.info(
+        "[pikpak] resolved",
+        resolved.length,
+        "files, deferred=",
+        deferred,
+        "loggedIn=",
+        loggedIn
+      );
+    })
+    .catch(function (e) {
+      throw new UserError("PikPak: " + ((e && e.message) || String(e)));
+    });
+});
+
+// 下载开始前再补全真实直链，避免大目录在 onResolve 阶段超时。
+gopeed.events.onStart(function (ctx) {
+  var req = ctx.task && ctx.task.meta && ctx.task.meta.req;
+  if (!req || !req.labels || req.labels.pikpak_file !== "1") {
+    return;
+  }
+  if (req.labels.pikpak_ready === "1") {
+    return;
+  }
+
+  var settings = gopeed.settings || {};
+  var client = new PikPakClient(settings);
+  client.passCodeToken = req.labels.pikpak_pass || "";
+  client.useTrans = req.labels.pikpak_use_trans === "1";
+  var shareId = req.labels.pikpak_share_id;
+  var fileId = req.labels.pikpak_file_id;
+  var name = req.labels.pikpak_name || fileId;
+
+  return client
+    .ensureLogin()
+    .then(function (loggedIn) {
+      return client.getFileInfo(shareId, fileId).then(function (info) {
+        var url = pickDownloadUrl(info.file_info || info, client.useTrans);
+        if (url) return { url: url, loggedIn: loggedIn };
+        if (!loggedIn) {
+          throw new Error(
+            "匿名访问无法获取「" +
+              name +
+              "」的下载地址（非视频需登录）。请在扩展设置中填写账号或 refresh_token"
+          );
+        }
+        var item = {
+          id: fileId,
+          name: name,
+          ancestors: req.labels.pikpak_ancestors
+            ? req.labels.pikpak_ancestors.split(",")
+            : [],
+          url: "",
+        };
+        return resolveByRestore(client, shareId, [item]).then(function () {
+          if (!item.url) {
+            throw new Error(
+              "已登录但仍无法获取「" +
+                name +
+                "」下载地址" +
+                (client.restoreError ? "（" + client.restoreError + "）" : "")
+            );
+          }
+          return { url: item.url, loggedIn: loggedIn };
+        });
+      });
+    })
+    .then(function (got) {
+      return Promise.resolve(ctx.task.meta.req.setUrl(got.url)).then(function () {
+        return Promise.resolve(ctx.task.meta.req.putLabel("pikpak_ready", "1"));
+      });
     })
     .catch(function (e) {
       throw new UserError("PikPak: " + ((e && e.message) || String(e)));
