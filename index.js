@@ -1062,80 +1062,115 @@ gopeed.events.onResolve(function (ctx) {
         "",
         startParentId ? [startParentId] : [],
         deadlineAt
-      );
+      ).then(function (files) {
+        return { files: files, deadlineAt: deadlineAt };
+      });
     })
-    .then(function (files) {
+    .then(function (pack) {
+      var files = pack.files;
+      var deadlineAt = pack.deadlineAt;
       if (!files.length) {
         throw new Error("分享内未找到任何可下载的文件");
       }
-      gopeed.logger.info(
-        "[pikpak] listed " + files.length + " files; download URLs deferred until start"
-      );
-      // 大目录下逐个 file_info 会超过 Gopeed ~60s 解析超时。
-      // 解析阶段只列文件；缺下载地址的用 PENDING_URL + labels，真正取链放到 onStart。
-      var resolved = [];
-      var deferred = 0;
+      gopeed.logger.info("[pikpak] listed " + files.length + " files");
+      // 列表后用剩余时间并发补直链；补不到的再交给 onStart。
+      var needUrl = [];
       for (var i = 0; i < files.length; i++) {
-        var item = files[i];
-        var headers = {
-          "User-Agent": DEFAULT_UA,
-          Referer: "https://mypikpak.com/",
-        };
-        if (item.url) {
+        if (!files[i].url) needUrl.push(files[i]);
+      }
+      var fillP = Promise.resolve();
+      if (needUrl.length && Date.now() < deadlineAt - 2000) {
+        gopeed.logger.info(
+          "[pikpak] filling download URLs concurrently:",
+          needUrl.length
+        );
+        fillP = mapPool(needUrl, 8, function (item) {
+          if (Date.now() >= deadlineAt - 1500) {
+            return Promise.resolve(item);
+          }
+          return client
+            .getFileInfo(parsed.shareId, item.id)
+            .then(function (info) {
+              var url = pickDownloadUrl(info.file_info || info, client.useTrans);
+              if (url && /^https?:\/\//i.test(url)) {
+                item.url = url;
+              }
+              return item;
+            })
+            .catch(function () {
+              return item;
+            });
+        });
+      }
+      return fillP.then(function () {
+        var resolved = [];
+        var deferred = 0;
+        var withUrl = 0;
+        for (var j = 0; j < files.length; j++) {
+          var item = files[j];
+          var headers = {
+            "User-Agent": DEFAULT_UA,
+            Referer: "https://mypikpak.com/",
+          };
+          if (item.url) {
+            withUrl++;
+            resolved.push({
+              name: item.name,
+              path: item.path || "",
+              size: item.size,
+              req: {
+                url: item.url,
+                extra: { header: headers },
+              },
+            });
+            continue;
+          }
+          deferred++;
+          var pendingMeta = {
+            shareId: parsed.shareId,
+            fileId: item.id,
+            pass: client.passCodeToken || "",
+            useTrans: client.useTrans,
+            ancestors: (item.ancestors || []).join(","),
+            name: item.name,
+          };
           resolved.push({
             name: item.name,
             path: item.path || "",
             size: item.size,
             req: {
-              url: item.url,
+              url: buildPendingUrl(pendingMeta),
+              labels: {
+                pikpak_file: "1",
+                pikpak_share_id: pendingMeta.shareId,
+                pikpak_file_id: pendingMeta.fileId,
+                pikpak_pass: pendingMeta.pass,
+                pikpak_use_trans: pendingMeta.useTrans ? "1" : "0",
+                pikpak_ancestors: pendingMeta.ancestors,
+                pikpak_name: pendingMeta.name,
+              },
               extra: { header: headers },
             },
           });
-          continue;
         }
-        deferred++;
-        var pendingMeta = {
-          shareId: parsed.shareId,
-          fileId: item.id,
-          pass: client.passCodeToken || "",
-          useTrans: client.useTrans,
-          ancestors: (item.ancestors || []).join(","),
-          name: item.name,
+        ctx.res = {
+          name:
+            resolved.length > 1
+              ? "PikPak-" + parsed.shareId.slice(-10)
+              : resolved[0].name,
+          files: resolved,
         };
-        resolved.push({
-          name: item.name,
-          path: item.path || "",
-          size: item.size,
-          req: {
-            url: buildPendingUrl(pendingMeta),
-            labels: {
-              pikpak_file: "1",
-              pikpak_share_id: pendingMeta.shareId,
-              pikpak_file_id: pendingMeta.fileId,
-              pikpak_pass: pendingMeta.pass,
-              pikpak_use_trans: pendingMeta.useTrans ? "1" : "0",
-              pikpak_ancestors: pendingMeta.ancestors,
-              pikpak_name: pendingMeta.name,
-            },
-            extra: { header: headers },
-          },
-        });
-      }
-      ctx.res = {
-        name:
-          resolved.length > 1
-            ? "PikPak-" + parsed.shareId.slice(-10)
-            : resolved[0].name,
-        files: resolved,
-      };
-      gopeed.logger.info(
-        "[pikpak] resolved",
-        resolved.length,
-        "files, deferred=",
-        deferred,
-        "loggedIn=",
-        loggedIn
-      );
+        gopeed.logger.info(
+          "[pikpak] resolved",
+          resolved.length,
+          "files, withUrl=",
+          withUrl,
+          "deferred=",
+          deferred,
+          "loggedIn=",
+          loggedIn
+        );
+      });
     })
     .catch(function (e) {
       throw new UserError("PikPak: " + ((e && e.message) || String(e)));
