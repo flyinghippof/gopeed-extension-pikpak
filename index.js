@@ -242,7 +242,44 @@ function parseShareUrl(rawUrl) {
 var REQUEST_TIMEOUT_MS = 30000;
 var REQUEST_ATTEMPTS = 5;
 // 未解析到直链前的占位地址（不可解析域名），避免误下载分享页 HTML。
+// 查询参数携带文件标识：Android 上 labels 可能未持久化，onStart 靠 URL 匹配兜底。
 var PENDING_URL = "https://pikpak-pending.invalid/file";
+
+function buildPendingUrl(meta) {
+  var q = [];
+  if (meta.shareId) q.push("s=" + encodeURIComponent(meta.shareId));
+  if (meta.fileId) q.push("f=" + encodeURIComponent(meta.fileId));
+  if (meta.pass) q.push("p=" + encodeURIComponent(meta.pass));
+  q.push("t=" + (meta.useTrans ? "1" : "0"));
+  if (meta.ancestors) q.push("a=" + encodeURIComponent(meta.ancestors));
+  if (meta.name) q.push("n=" + encodeURIComponent(meta.name));
+  return PENDING_URL + "?" + q.join("&");
+}
+
+function parsePendingUrl(url) {
+  if (!url || url.indexOf("pikpak-pending.invalid") === -1) return null;
+  var q = {};
+  var qi = url.indexOf("?");
+  if (qi < 0) return { shareId: "", fileId: "", pass: "", useTrans: false, ancestors: "", name: "" };
+  var parts = url.slice(qi + 1).split("&");
+  for (var i = 0; i < parts.length; i++) {
+    var kv = parts[i].split("=");
+    if (kv.length < 2) continue;
+    try {
+      q[kv[0]] = decodeURIComponent(kv.slice(1).join("=").replace(/\+/g, " "));
+    } catch (e) {
+      q[kv[0]] = kv.slice(1).join("=");
+    }
+  }
+  return {
+    shareId: q.s || "",
+    fileId: q.f || "",
+    pass: q.p || "",
+    useTrans: q.t === "1",
+    ancestors: q.a || "",
+    name: q.n || "",
+  };
+}
 
 function waitForRetry(ms) {
   return new Promise(function (resolve) {
@@ -1036,20 +1073,28 @@ gopeed.events.onResolve(function (ctx) {
           continue;
         }
         deferred++;
+        var pendingMeta = {
+          shareId: parsed.shareId,
+          fileId: item.id,
+          pass: client.passCodeToken || "",
+          useTrans: client.useTrans,
+          ancestors: (item.ancestors || []).join(","),
+          name: item.name,
+        };
         resolved.push({
           name: item.name,
           path: item.path || "",
           size: item.size,
           req: {
-            url: PENDING_URL,
+            url: buildPendingUrl(pendingMeta),
             labels: {
               pikpak_file: "1",
-              pikpak_share_id: parsed.shareId,
-              pikpak_file_id: item.id,
-              pikpak_pass: client.passCodeToken || "",
-              pikpak_use_trans: client.useTrans ? "1" : "0",
-              pikpak_ancestors: (item.ancestors || []).join(","),
-              pikpak_name: item.name,
+              pikpak_share_id: pendingMeta.shareId,
+              pikpak_file_id: pendingMeta.fileId,
+              pikpak_pass: pendingMeta.pass,
+              pikpak_use_trans: pendingMeta.useTrans ? "1" : "0",
+              pikpak_ancestors: pendingMeta.ancestors,
+              pikpak_name: pendingMeta.name,
             },
             extra: { header: headers },
           },
@@ -1079,20 +1124,40 @@ gopeed.events.onResolve(function (ctx) {
 // 下载开始前再补全真实直链；恢复任务时也会重新取链，避免复用过期地址。
 gopeed.events.onStart(function (ctx) {
   var req = ctx.task && ctx.task.meta && ctx.task.meta.req;
-  if (!req || !req.labels || req.labels.pikpak_file !== "1") {
-    return;
-  }
+  if (!req) return;
+
+  var labels = req.labels || {};
+  var fromUrl = parsePendingUrl(req.url || "");
+  // labels 优先；Android 上 labels 丢失时从占位 URL 查询参数恢复。
+  var shareId = labels.pikpak_share_id || (fromUrl && fromUrl.shareId) || "";
+  var fileId = labels.pikpak_file_id || (fromUrl && fromUrl.fileId) || "";
+  var name =
+    labels.pikpak_name || (fromUrl && fromUrl.name) || fileId || "file";
+  var pass = labels.pikpak_pass || (fromUrl && fromUrl.pass) || "";
+  var useTrans =
+    labels.pikpak_use_trans === "1" || !!(fromUrl && fromUrl.useTrans);
+  var ancestorsStr =
+    labels.pikpak_ancestors || (fromUrl && fromUrl.ancestors) || "";
+  var isPikpak =
+    labels.pikpak_file === "1" ||
+    !!(fromUrl && (fromUrl.fileId || fromUrl.shareId));
+  if (!isPikpak) return;
 
   var settings = gopeed.settings || {};
   var client = new PikPakClient(settings);
-  client.passCodeToken = req.labels.pikpak_pass || "";
-  client.useTrans = req.labels.pikpak_use_trans === "1";
-  var shareId = req.labels.pikpak_share_id;
-  var fileId = req.labels.pikpak_file_id;
-  var name = req.labels.pikpak_name || fileId;
+  client.passCodeToken = pass;
+  client.useTrans = useTrans;
 
-  // Gopeed 1.9.x：onStart 失败后仍可能继续用旧 URL；先改回不可下载占位，失败则闭包。
-  return Promise.resolve(ctx.task.meta.req.setUrl(PENDING_URL))
+  // 先保持占位（带参数），避免 onStart 失败后引擎误下分享页；成功后再 setUrl 真链。
+  var holdUrl = buildPendingUrl({
+    shareId: shareId,
+    fileId: fileId,
+    pass: pass,
+    useTrans: useTrans,
+    ancestors: ancestorsStr,
+    name: name,
+  });
+  return Promise.resolve(ctx.task.meta.req.setUrl(holdUrl))
     .then(function () {
       if (!shareId || !fileId) {
         throw new Error("缺少分享或文件标识，请重新创建任务");
@@ -1100,7 +1165,6 @@ gopeed.events.onStart(function (ctx) {
       return client.ensureLogin();
     })
     .then(function (loggedIn) {
-      // 密码分享：启动时再换一次 pass_code_token（标签里可能过期）
       var passP = Promise.resolve();
       if (client.sharePwd && !client.passCodeToken) {
         passP = client.getShareInfo(shareId, client.sharePwd).then(function (info) {
@@ -1123,9 +1187,7 @@ gopeed.events.onStart(function (ctx) {
           var item = {
             id: fileId,
             name: name,
-            ancestors: req.labels.pikpak_ancestors
-              ? req.labels.pikpak_ancestors.split(",")
-              : [],
+            ancestors: ancestorsStr ? ancestorsStr.split(",") : [],
             url: "",
           };
           return resolveByRestore(client, shareId, [item]).then(function () {
@@ -1143,7 +1205,6 @@ gopeed.events.onStart(function (ctx) {
       });
     })
     .then(function (got) {
-      // setUrl 为主；同时写 req.url，避免部分端上 setUrl 未生效仍沿用占位地址。
       req.url = got.url;
       return Promise.resolve(ctx.task.meta.req.setUrl(got.url)).then(function () {
         gopeed.logger.info("[pikpak] download URL ready:", name);
