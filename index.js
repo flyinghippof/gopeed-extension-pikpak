@@ -237,7 +237,8 @@ function parseShareUrl(rawUrl) {
 }
 
 // ====== HTTP 客户端封装 ======
-// 参考 PR #1：Gopeed 的 fetch 超时不可靠，改用 XHR；并对短暂网络错误做退避重试。
+// Android Gopeed 上 XHR 易卡死导致整次解析超时；继续用 fetch + 超时竞态，
+// 并吸收 PR #1 的多轮退避重试 / Retry-After。
 var REQUEST_TIMEOUT_MS = 30000;
 var REQUEST_ATTEMPTS = 5;
 // 未解析到直链前的占位地址（不可解析域名），避免误下载分享页 HTML。
@@ -250,40 +251,38 @@ function waitForRetry(ms) {
 }
 
 function requestJsonOnce(opts) {
-  return new Promise(function (resolve, reject) {
-    var xhr = new XMLHttpRequest();
-    xhr.open(opts.method || "GET", opts.url);
-    xhr.timeout = REQUEST_TIMEOUT_MS;
-    var headers = opts.headers || {};
-    for (var key in headers) {
-      xhr.setRequestHeader(key, headers[key]);
-    }
-    xhr.onload = function () {
-      var text = xhr.responseText || "";
+  var request = fetch(opts.url, {
+    method: opts.method || "GET",
+    headers: opts.headers || {},
+    body: opts.body || undefined,
+  });
+  var timeout = new Promise(function (_, reject) {
+    setTimeout(function () {
+      reject(new Error("request timed out (30s)"));
+    }, REQUEST_TIMEOUT_MS);
+  });
+  return Promise.race([request, timeout]).then(function (resp) {
+    return resp.text().then(function (text) {
       var data = null;
       try {
         data = text ? JSON.parse(text) : null;
       } catch (e) {
         // 非 JSON
       }
-      resolve({
-        status: xhr.status,
-        ok: xhr.status >= 200 && xhr.status < 300,
+      var retryAfter = null;
+      try {
+        if (resp.headers && resp.headers.get) {
+          retryAfter = resp.headers.get("Retry-After");
+        }
+      } catch (e2) {}
+      return {
+        status: resp.status,
+        ok: resp.ok,
         text: text,
         data: data,
-        retryAfter: xhr.getResponseHeader("Retry-After"),
-      });
-    };
-    xhr.onerror = function () {
-      reject(new Error("network connection failed"));
-    };
-    xhr.ontimeout = function () {
-      reject(new Error("request timed out (30s)"));
-    };
-    xhr.onabort = function () {
-      reject(new Error("request aborted"));
-    };
-    xhr.send(opts.body || null);
+        retryAfter: retryAfter,
+      };
+    });
   });
 }
 
@@ -1144,6 +1143,8 @@ gopeed.events.onStart(function (ctx) {
       });
     })
     .then(function (got) {
+      // setUrl 为主；同时写 req.url，避免部分端上 setUrl 未生效仍沿用占位地址。
+      req.url = got.url;
       return Promise.resolve(ctx.task.meta.req.setUrl(got.url)).then(function () {
         gopeed.logger.info("[pikpak] download URL ready:", name);
       });
