@@ -1161,30 +1161,31 @@ gopeed.events.onStart(function (ctx) {
     labels.pikpak_ancestors || (fromUrl && fromUrl.ancestors) || "";
   var isPikpak =
     labels.pikpak_file === "1" ||
-    !!(fromUrl && (fromUrl.fileId || fromUrl.shareId));
-  if (!isPikpak) return;
+    !!(fromUrl && fromUrl.fileId && fromUrl.shareId);
+  if (!isPikpak) {
+    return;
+  }
+  gopeed.logger.info(
+    "[pikpak] onStart",
+    name,
+    "share=",
+    shareId,
+    "file=",
+    fileId
+  );
 
   var settings = gopeed.settings || {};
   var client = new PikPakClient(settings);
   client.passCodeToken = pass;
   client.useTrans = useTrans;
 
-  // 先保持占位（带参数），避免 onStart 失败后引擎误下分享页；成功后再 setUrl 真链。
-  var holdUrl = buildPendingUrl({
-    shareId: shareId,
-    fileId: fileId,
-    pass: pass,
-    useTrans: useTrans,
-    ancestors: ancestorsStr,
-    name: name,
-  });
-  return Promise.resolve(ctx.task.meta.req.setUrl(holdUrl))
-    .then(function () {
-      if (!shareId || !fileId) {
-        throw new Error("缺少分享或文件标识，请重新创建任务");
-      }
-      return client.ensureLogin();
-    })
+  // 注意：onStart 开头不要 setUrl(占位)，部分端上 setUrl 会再次触发 onStart 造成死锁/空转。
+  if (!shareId || !fileId) {
+    throw new UserError("PikPak：缺少分享或文件标识，请重新创建任务");
+  }
+
+  return client
+    .ensureLogin()
     .then(function (loggedIn) {
       var passP = Promise.resolve();
       if (client.sharePwd && !client.passCodeToken) {
@@ -1196,7 +1197,7 @@ gopeed.events.onStart(function (ctx) {
         return client.getFileInfo(shareId, fileId).then(function (info) {
           var url = pickDownloadUrl(info.file_info || info, client.useTrans);
           if (url && /^https?:\/\//i.test(url)) {
-            return { url: url };
+            return { url: url, loggedIn: loggedIn };
           }
           if (!loggedIn) {
             throw new Error(
@@ -1220,7 +1221,7 @@ gopeed.events.onStart(function (ctx) {
                   (client.restoreError ? "（" + client.restoreError + "）" : "")
               );
             }
-            return { url: item.url };
+            return { url: item.url, loggedIn: loggedIn };
           });
         });
       });
