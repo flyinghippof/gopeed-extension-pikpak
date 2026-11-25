@@ -241,26 +241,24 @@ function parseShareUrl(rawUrl) {
 // 并吸收 PR #1 的多轮退避重试 / Retry-After。
 var REQUEST_TIMEOUT_MS = 30000;
 var REQUEST_ATTEMPTS = 5;
-// 未解析到直链前的占位地址（不可解析域名），避免误下载分享页 HTML。
-// 查询参数携带文件标识：Android 上 labels 可能未持久化，onStart 靠 URL 匹配兜底。
-var PENDING_URL = "https://pikpak-pending.invalid/file";
-
+// 占位地址挂在 mypikpak 分享路径上（带 gp_pikpak=1），保证 onStart 的 URL 匹配能命中。
+// 查询参数携带文件标识：Android 上 labels 可能未持久化。
 function buildPendingUrl(meta) {
-  var q = [];
-  if (meta.shareId) q.push("s=" + encodeURIComponent(meta.shareId));
+  var shareId = meta.shareId || "unknown";
+  var q = ["gp_pikpak=1"];
   if (meta.fileId) q.push("f=" + encodeURIComponent(meta.fileId));
   if (meta.pass) q.push("p=" + encodeURIComponent(meta.pass));
   q.push("t=" + (meta.useTrans ? "1" : "0"));
   if (meta.ancestors) q.push("a=" + encodeURIComponent(meta.ancestors));
   if (meta.name) q.push("n=" + encodeURIComponent(meta.name));
-  return PENDING_URL + "?" + q.join("&");
+  return "https://mypikpak.com/s/" + encodeURIComponent(shareId) + "?" + q.join("&");
 }
 
-function parsePendingUrl(url) {
-  if (!url || url.indexOf("pikpak-pending.invalid") === -1) return null;
+function parseQuery(url) {
   var q = {};
+  if (!url) return q;
   var qi = url.indexOf("?");
-  if (qi < 0) return { shareId: "", fileId: "", pass: "", useTrans: false, ancestors: "", name: "" };
+  if (qi < 0) return q;
   var parts = url.slice(qi + 1).split("&");
   for (var i = 0; i < parts.length; i++) {
     var kv = parts[i].split("=");
@@ -271,8 +269,31 @@ function parsePendingUrl(url) {
       q[kv[0]] = kv.slice(1).join("=");
     }
   }
+  return q;
+}
+
+function parsePendingUrl(url) {
+  if (!url) return null;
+  var q = parseQuery(url);
+  var shareId = q.s || "";
+  // https://mypikpak.com/s/{shareId}?gp_pikpak=1&f=...
+  var m = String(url).match(/mypikpak\.(?:com|net)\/s\/([^/?#]+)/i);
+  if (m) {
+    try {
+      shareId = decodeURIComponent(m[1]);
+    } catch (e) {
+      shareId = m[1];
+    }
+  }
+  if (url.indexOf("pikpak-pending.invalid") !== -1) {
+    shareId = q.s || shareId;
+  }
+  // 普通分享页（无 gp_pikpak）不是占位任务
+  if (url.indexOf("pikpak-pending.invalid") === -1 && q.gp_pikpak !== "1") {
+    return null;
+  }
   return {
-    shareId: q.s || "",
+    shareId: shareId,
     fileId: q.f || "",
     pass: q.p || "",
     useTrans: q.t === "1",
